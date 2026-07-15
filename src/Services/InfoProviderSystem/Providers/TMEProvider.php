@@ -37,15 +37,8 @@ class TMEProvider implements InfoProviderInterface, URLHandlerInfoProviderInterf
 
     private const VENDOR_NAME = 'TME';
 
-    private readonly bool $get_gross_prices;
     public function __construct(private readonly TMEClient $tmeClient, private readonly TMESettings $settings)
     {
-        //If we have a private token, set get_gross_prices to false, as it is automatically determined by the account type then
-        if ($this->tmeClient->isUsingPrivateToken()) {
-            $this->get_gross_prices = false;
-        } else {
-            $this->get_gross_prices = $this->settings->grossPrices;
-        }
     }
 
     public function getProviderInfo(): array
@@ -71,28 +64,32 @@ class TMEProvider implements InfoProviderInterface, URLHandlerInfoProviderInterf
 
     public function searchByKeyword(string $keyword, array $options = []): array
     {
-        $response = $this->tmeClient->makeRequest('Products/Search', [
-            'Country' => $this->settings->country,
-            'Language' => $this->settings->language,
-            'SearchPlain' => $keyword,
+        $response = $this->tmeClient->makeRequest('/products/search', [
+            'country' => $this->settings->country,
+            'scope' => ['products'],
+            'phrase' => $keyword,
+            'limit' => 100,
         ]);
 
-        $data = $response->toArray()['Data'];
+        $data = $response->toArray()['data'];
 
         $result = [];
 
-        foreach($data['ProductList'] as $product) {
+        foreach($data['products']['elements'] ?? [] as $product) {
+
+            $symbol = $product['symbol'];
+
             $result[] = new SearchResultDTO(
                 provider_key: $this->getProviderKey(),
-                provider_id: $product['Symbol'],
-                name: empty($product['OriginalSymbol']) ? $product['Symbol'] : $product['OriginalSymbol'],
-                description: $product['Description'],
-                category: $product['Category'],
-                manufacturer: $product['Producer'],
-                mpn: $product['OriginalSymbol'] ?? null,
-                preview_image_url: $this->normalizeURL($product['Photo']),
-                manufacturing_status: $this->productStatusArrayToManufacturingStatus($product['ProductStatusList']),
-                provider_url: $this->normalizeURL($product['ProductInformationPage']),
+                provider_id: $symbol,
+                name: empty($product['manufacturer_symbols']) ? $product['symbol'] : $product['manufacturer_symbols'][0],
+                description: $product['description'],
+                category: $product['category']['name'] ?? null,
+                manufacturer: $product['manufacturer']['name'] ?? null,
+                mpn: $product['manufacturer_symbols'][0] ?? null,
+                preview_image_url: $this->normalizeURL($product['assets']['primary_photo']['prime'] ?? null),
+                manufacturing_status: $this->productStatusArrayToManufacturingStatus($product['product_status'] ?? null),
+                provider_url: $this->normalizeURL($this->constructPartInfoUrl($symbol)),
             );
         }
 
@@ -136,6 +133,35 @@ class TMEProvider implements InfoProviderInterface, URLHandlerInfoProviderInterf
             vendor_infos: [$this->getVendorInfo($id, $productInfoPage)],
             mass: $product['WeightUnit'] === 'g' ? $product['Weight'] : null,
         );
+    }
+
+    public function getCapabilities(): array
+    {
+        return [
+            ProviderCapabilities::BASIC,
+            ProviderCapabilities::FOOTPRINT,
+            ProviderCapabilities::PICTURE,
+            ProviderCapabilities::DATASHEET,
+            ProviderCapabilities::PRICE,
+        ];
+    }
+
+    public function getHandledDomains(): array
+    {
+        return ['tme.eu'];
+    }
+
+    public function getIDFromURL(string $url): ?string
+    {
+        //Input: https://www.tme.eu/de/details/fi321_se/kuhler/alutronic/
+        //The ID is the part after the details segment and before the next slash
+
+        $matches = [];
+        if (preg_match('#/details/([^/]+)/#', $url, $matches) === 1) {
+            return $matches[1];
+        }
+
+        return null;
     }
 
     /**
@@ -266,7 +292,10 @@ class TMEProvider implements InfoProviderInterface, URLHandlerInfoProviderInterf
             return ManufacturingStatus::EOL;
         }
 
-        if (in_array('INVALID', $statusArray, true)) {
+        if (in_array('INVALID', $statusArray, true) ||
+            in_array('PRODUCT_BLOCKED', $statusArray, true) ||
+            in_array('NOT_IN_OFFER', $statusArray, true)
+        ) {
             return ManufacturingStatus::DISCONTINUED;
         }
 
@@ -276,8 +305,12 @@ class TMEProvider implements InfoProviderInterface, URLHandlerInfoProviderInterf
 
 
 
-    private function normalizeURL(string $url): string
+    private function normalizeURL(?string $url): ?string
     {
+        if ($url == null) {
+            return null;
+        }
+
         //If a URL starts with // we assume that it is a relative URL and we add the protocol
         if (str_starts_with($url, '//')) {
             $url = 'https:' . $url;
@@ -290,32 +323,16 @@ class TMEProvider implements InfoProviderInterface, URLHandlerInfoProviderInterf
         return $url;
     }
 
-    public function getCapabilities(): array
+    /**
+     * Construct the product detail page URL from the symbol.
+     * NOTE: the /xx/xx localization part of the URL is omitted, as TME automaticallyredirects to the correct version of the site
+     * @param string $symbol part symbol
+     * @return string product detail URL
+     */
+    private function constructPartInfoUrl(string $symbol): string
     {
-        return [
-            ProviderCapabilities::BASIC,
-            ProviderCapabilities::FOOTPRINT,
-            ProviderCapabilities::PICTURE,
-            ProviderCapabilities::DATASHEET,
-            ProviderCapabilities::PRICE,
-        ];
+        return "https://www.tme.eu/details/{$symbol}";
     }
 
-    public function getHandledDomains(): array
-    {
-        return ['tme.eu'];
-    }
 
-    public function getIDFromURL(string $url): ?string
-    {
-        //Input: https://www.tme.eu/de/details/fi321_se/kuhler/alutronic/
-        //The ID is the part after the details segment and before the next slash
-
-        $matches = [];
-        if (preg_match('#/details/([^/]+)/#', $url, $matches) === 1) {
-            return $matches[1];
-        }
-
-        return null;
-    }
 }

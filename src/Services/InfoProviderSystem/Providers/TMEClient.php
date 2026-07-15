@@ -39,7 +39,8 @@ class TMEClient
         private readonly TMESettings $settings,
         #[Autowire(service: 'info_provider.cache')]
         private readonly CacheInterface $cache
-    ) {
+    )
+    {
 
     }
 
@@ -85,7 +86,7 @@ class TMEClient
 
             // Request new session from the API
             $response = $this->tmeClient->request('POST', $this->getUrlForEndpoint('/auth/token'), [
-                'auth_basic' => [$this->settings->apiToken, $this->settings->apiSecret],
+                'auth_basic' => [$this->settings->apiSecret, $this->settings->apiToken],
                 'body' => ['grant_type' => 'client_credentials'],
             ]);
 
