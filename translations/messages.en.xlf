@@ -9722,10 +9722,10 @@ Please note, that you can not impersonate a disabled user. If you try you will g
         <target>Country</target>
       </segment>
     </unit>
-    <unit id="Mf2WKob" name="settings.ips.tme.grossPrices">
+    <unit id="ubWOB.4" name="settings.ips.tme.preferMetricFootprint">
       <segment state="translated">
-        <source>settings.ips.tme.grossPrices</source>
-        <target>Get gross prices (including tax)</target>
+        <source>settings.ips.tme.preferMetricFootprint</source>
+        <target>Use metric footprint when both metric and imperial are available</target>
       </segment>
     </unit>
     <unit id="A.x1dyH" name="settings.ips.mouser">

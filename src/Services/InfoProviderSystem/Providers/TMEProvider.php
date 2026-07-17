@@ -132,7 +132,7 @@ class TMEProvider implements InfoProviderInterface, URLHandlerInfoProviderInterf
             images: $files['images'],
             parameters: $parameters['parameters'],
             vendor_infos: [$vendor_info],
-            mass: $product['weight']['unit'] === 'g' ? $product['weight']['value'] : null,
+            mass: $product['weight']['unit'] ?? null === 'g' ? $product['weight']['value'] : null,
         );
     }
 
@@ -229,7 +229,7 @@ class TMEProvider implements InfoProviderInterface, URLHandlerInfoProviderInterf
 
         $footprint = null;
         $footprint_imperial = null;
-
+        $footprint_metric = null;
 
         foreach($parameters as $parameter) {
 
@@ -244,11 +244,18 @@ class TMEProvider implements InfoProviderInterface, URLHandlerInfoProviderInterf
                 $footprint = $value;
             } else if ($id == 2932) {
                 $footprint_imperial = $value;
+            } else if ($id == 2931) {
+                $footprint_metric = $value;
             }
         }
 
+        // Select correct footprint
+        $footprint = $this->settings->preferMetricFootprint ?
+                ($footprint_metric ?? $footprint ?? $footprint_imperial) :
+                ($footprint_imperial ?? $footprint ?? $footprint_metric);
+
         return [
-            'footprint' => $footprint ?? $footprint_imperial,
+            'footprint' => $footprint,
             'parameters' => $parameters_dtos
         ];
     }
