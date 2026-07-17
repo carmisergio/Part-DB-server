@@ -90,6 +90,7 @@ class TMEProvider implements InfoProviderInterface, URLHandlerInfoProviderInterf
                 preview_image_url: $this->normalizeURL($product['assets']['primary_photo']['prime'] ?? null),
                 manufacturing_status: $this->productStatusArrayToManufacturingStatus($product['product_status'] ?? null),
                 provider_url: $this->normalizeURL($this->constructPartInfoUrl($symbol)),
+                gtin: $product['ean'] ?? null
             );
         }
 
@@ -98,40 +99,40 @@ class TMEProvider implements InfoProviderInterface, URLHandlerInfoProviderInterf
 
     public function getDetails(string $id, array $options = []): PartDetailDTO
     {
-        $response = $this->tmeClient->makeRequest('Products/GetProducts', [
-            'Country' => $this->settings->country,
-            'Language' => $this->settings->language,
-            'SymbolList' => [$id],
+        $response = $this->tmeClient->makeRequest('products', [
+            'country' => $this->settings->country,
+            'symbols' => [$id],
         ]);
 
-        $product = $response->toArray()['Data']['ProductList'][0];
+        $product = $response->toArray()['data']['elements'][0];
 
-        //Add a explicit https:// to the url if it is missing
-        $productInfoPage = $this->normalizeURL($product['ProductInformationPage']);
+        $product_page = $this->normalizeURL($this->constructPartInfoUrl($id));
 
+        // Get additional product data
         $files = $this->getFiles($id);
-
-        $footprint = null;
-
         $parameters = $this->getParameters($id, $footprint);
+        $vendor_info = $this->getVendorInfo($id, $product_page);
 
         return new PartDetailDTO(
             provider_key: $this->getProviderKey(),
-            provider_id: $product['Symbol'],
-            name:  empty($product['OriginalSymbol']) ? $product['Symbol'] : $product['OriginalSymbol'],
-            description: $product['Description'],
-            category: $product['Category'],
-            manufacturer: $product['Producer'],
-            mpn: $product['OriginalSymbol'] ?? null,
-            preview_image_url: $this->normalizeURL($product['Photo']),
-            manufacturing_status: $this->productStatusArrayToManufacturingStatus($product['ProductStatusList']),
-            provider_url: $productInfoPage,
-            footprint: $footprint,
+            provider_id: $id,
+            name: empty($product['manufacturer_symbols']) ? $product['symbol'] : $product['manufacturer_symbols'][0],
+            description: $product['description'],
+            category: $product['category']['name'] ?? null,
+            manufacturer: $product['manufacturer']['name'] ?? null,
+            mpn: $product['manufacturer_symbols'][0] ?? null,
+            preview_image_url: $this->normalizeURL($product['assets']['primary_photo']['high_resolution'] ??
+                $product['assets']['primary_photo']['prime'] ?? null),
+            manufacturing_status: $this->productStatusArrayToManufacturingStatus($product['product_status'] ?? null),
+            provider_url: $this->normalizeURL($this->constructPartInfoUrl($id)),
+            gtin: $product['ean'] ?? null,
+
+            footprint: $parameters['footprint'],
             datasheets: $files['datasheets'],
             images: $files['images'],
-            parameters: $parameters,
-            vendor_infos: [$this->getVendorInfo($id, $productInfoPage)],
-            mass: $product['WeightUnit'] === 'g' ? $product['Weight'] : null,
+            parameters: $parameters['parameters'],
+            vendor_infos: [$vendor_info],
+            mass: $product['weight']['unit'] === 'g' ? $product['weight']['value'] : null,
         );
     }
 
@@ -172,37 +173,83 @@ class TMEProvider implements InfoProviderInterface, URLHandlerInfoProviderInterf
      */
     public function getFiles(string $id): array
     {
-        $response = $this->tmeClient->makeRequest('Products/GetProductsFiles', [
-            'Country' => $this->settings->country,
-            'Language' => $this->settings->language,
-            'SymbolList' => [$id],
+        $response = $this->tmeClient->makeRequest('products/files', [
+            'country' => $this->settings->country,
+            'symbols' => [$id],
         ]);
 
-        $data = $response->toArray()['Data'];
-        $files = $data['ProductList'][0]['Files'];
+        $files = $response->toArray()['data']['elements'][0];
 
         //Extract datasheets
-        $documentList = $files['DocumentList'];
+        $documents = $files['documents']['elements'];
         $datasheets = [];
-        foreach($documentList as $document) {
-            $datasheets[] = new FileDTO(
-                url: $this->normalizeURL($document['DocumentUrl']),
-            );
+        foreach ($documents as $document) {
+
+            // Check document type
+            $validDocumentTypes = ['INS', 'DTE', 'KCH', 'GWA', 'INB', 'PRE'];
+            if (in_array($document['type'], $validDocumentTypes, true)) {
+
+                $datasheets[] = new FileDTO(
+                    url: $this->normalizeURL($document['url']),
+                    name: $document['file_name']
+                );
+
+            }
         }
 
         //Extract images
-        $imageList = $files['AdditionalPhotoList'];
-        $images = [];
-        foreach($imageList as $image) {
-            $images[] = new FileDTO(
-                url: $this->normalizeURL($image['HighResolutionPhoto']),
-            );
+        $images = $files['assets']['additional']['elements'];
+        $image_dtos = [];
+        foreach($images as $image) {
+            $image_url = $this->normalizeURL($image['high_resolution'] ?? $image['prime'] ?? null);
+            $image_dtos[] = new FileDTO(url: $image_url);
         }
-
 
         return [
             'datasheets' => $datasheets,
-            'images' => $images,
+            'images' => $image_dtos,
+        ];
+    }
+
+    /**
+     * Fetches the parameters of a product
+     * @param  string  $id
+     * @return array {footprint: string, parameters: ParameterDTO[]}
+     */
+    public function getParameters(string $id, string|null &$footprint_name = null): array
+    {
+        $response = $this->tmeClient->makeRequest('/products/parameters', [
+            'country' => $this->settings->country,
+            'symbols' => [$id],
+        ]);
+
+        $parameters = $response->toArray()['data']['elements'][0]['parameters']['elements'];
+
+        $parameters_dtos = [];
+
+        $footprint = null;
+        $footprint_imperial = null;
+
+
+        foreach($parameters as $parameter) {
+
+            $id = $parameter['id'];
+            $value = $parameter['values'][0]['value'];
+
+            $parameters_dtos[] = ParameterDTO::parseValueIncludingUnit($parameter['name'], $value);
+
+            // Check if the parameter is the case/footprint
+            // id 35 is Case, id 2932 is Case-inch, id 2931 is Case-mm
+            if ($id === 35) {
+                $footprint = $value;
+            } else if ($id == 2932) {
+                $footprint_imperial = $value;
+            }
+        }
+
+        return [
+            'footprint' => $footprint ?? $footprint_imperial,
+            'parameters' => $parameters_dtos
         ];
     }
 
@@ -214,28 +261,23 @@ class TMEProvider implements InfoProviderInterface, URLHandlerInfoProviderInterf
      */
     public function getVendorInfo(string $id, ?string $productURL = null): PurchaseInfoDTO
     {
-        $response = $this->tmeClient->makeRequest('Products/GetPricesAndStocks', [
-            'Country' => $this->settings->country,
-            'Language' => $this->settings->language,
-            'Currency' => $this->settings->currency,
-            'GrossPrices' => $this->get_gross_prices,
-            'SymbolList' => [$id],
+        $response = $this->tmeClient->makeRequest('/products/data', [
+            'country' => $this->settings->country,
+            'currency' => $this->settings->currency,
+            'scope' => ['prices'],
+            'symbols' => [$id],
         ]);
 
-        $data = $response->toArray()['Data'];
-        $currency = $data['Currency'];
-        $include_tax = $data['PriceType'] === 'GROSS';
+        $prices = $response->toArray()['data']['elements'][0]['prices'];
 
+        $currency = $prices['currency'];
+        $include_tax = $prices['type'] === 'GROSS';
 
-        $product = $response->toArray()['Data']['ProductList'][0];
-        $vendor_order_number = $product['Symbol'];
-        $priceList = $product['PriceList'];
-
-        $prices = [];
-        foreach ($priceList as $price) {
-            $prices[] = new PriceDTO(
-                minimum_discount_amount: $price['Amount'],
-                price: (string) $price['PriceValue'],
+        $prices_dtos = [];
+        foreach ($prices['elements'] as $price) {
+            $prices_dtos[] = new PriceDTO(
+                minimum_discount_amount: $price['amount'],
+                price: (string) $price['price'],
                 currency_iso_code: $currency,
                 includes_tax: $include_tax,
             );
@@ -243,43 +285,12 @@ class TMEProvider implements InfoProviderInterface, URLHandlerInfoProviderInterf
 
         return new PurchaseInfoDTO(
             distributor_name: self::VENDOR_NAME,
-            order_number:  $vendor_order_number,
-            prices:  $prices,
+            order_number:  $id,
+            prices:  $prices_dtos,
             product_url: $productURL,
         );
     }
 
-    /**
-     * Fetches the parameters of a product
-     * @param  string  $id
-     * @param string|null  $footprint_name You can pass a variable by reference, where the name of the footprint will be stored
-     * @return ParameterDTO[]
-     */
-    public function getParameters(string $id, string|null &$footprint_name = null): array
-    {
-        $response = $this->tmeClient->makeRequest('Products/GetParameters', [
-            'Country' => $this->settings->country,
-            'Language' => $this->settings->language,
-            'SymbolList' => [$id],
-        ]);
-
-        $data = $response->toArray()['Data']['ProductList'][0];
-
-        $result = [];
-
-        $footprint_name = null;
-
-        foreach($data['ParameterList'] as $parameter) {
-            $result[] = ParameterDTO::parseValueIncludingUnit($parameter['ParameterName'], $parameter['ParameterValue']);
-
-            //Check if the parameter is the case/footprint
-            if ($parameter['ParameterId'] === 35) {
-                $footprint_name = $parameter['ParameterValue'];
-            }
-        }
-
-        return $result;
-    }
 
     /**
      * Convert the array of product statuses to a single manufacturing status
@@ -325,7 +336,7 @@ class TMEProvider implements InfoProviderInterface, URLHandlerInfoProviderInterf
 
     /**
      * Construct the product detail page URL from the symbol.
-     * NOTE: the /xx/xx localization part of the URL is omitted, as TME automaticallyredirects to the correct version of the site
+     * NOTE: the /xx/xx localization part of the URL is omitted, as TME automatically redirects to the correct version of the site
      * @param string $symbol part symbol
      * @return string product detail URL
      */

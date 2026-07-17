@@ -23,6 +23,8 @@ declare(strict_types=1);
 namespace App\Tests\Services\InfoProviderSystem\Providers;
 
 use App\Entity\Parts\ManufacturingStatus;
+use App\Services\InfoProviderSystem\DTOs\FileDTO;
+use App\Services\InfoProviderSystem\DTOs\ParameterDTO;
 use App\Services\InfoProviderSystem\DTOs\PartDetailDTO;
 use App\Services\InfoProviderSystem\DTOs\PurchaseInfoDTO;
 use App\Services\InfoProviderSystem\DTOs\SearchResultDTO;
@@ -41,18 +43,24 @@ final class TMEProviderTest extends TestCase
     private TMEProvider $provider;
     private MockHttpClient $httpClient;
 
+
     protected function setUp(): void
     {
         $this->httpClient = new MockHttpClient();
         $this->settings = SettingsTestHelper::createSettingsDummy(TMESettings::class);
-        // Use a short (anonymous-style) token so grossPrices is read from settings
-        $this->settings->apiToken = 'test_token_000000000000000000000000000000000000000';
+        $this->settings->apiToken = 'test_token';
         $this->settings->apiSecret = 'test_secret';
         $this->settings->currency = 'EUR';
-        $this->settings->language = 'en';
         $this->settings->country = 'DE';
-        $this->settings->grossPrices = false;
-        $this->provider = new TMEProvider(new TMEClient($this->httpClient, $this->settings), $this->settings);
+        $cache = new \Symfony\Component\Cache\Adapter\ArrayAdapter();
+
+        // Pre-populate the cache with a fake token so that tests don't make an HTTP auth request
+        $cacheKey = 'tme_api_v2_token_' . hash('xxh3', $this->settings->apiToken . $this->settings->apiSecret);
+        $item = $cache->getItem($cacheKey);
+        $item->set('fake_test_token');
+        $cache->save($item);
+
+        $this->provider = new TMEProvider(new TMEClient($this->httpClient, $this->settings, $cache), $this->settings);
     }
 
     // --- Mock response helpers ---
@@ -61,24 +69,24 @@ final class TMEProviderTest extends TestCase
     private function mockProductList(array $products): MockResponse
     {
         return new MockResponse(json_encode([
-            'Status' => 'OK',
-            'Data'   => ['ProductList' => $products],
+            'status' => 'OK',
+            'data'   => ['products' => $products],
         ]));
     }
 
     private function mockFilesList(array $products): MockResponse
     {
         return new MockResponse(json_encode([
-            'Status' => 'OK',
-            'Data'   => ['ProductList' => $products],
+            'status' => 'OK',
+            'data'   => ['products' => $products],
         ]));
     }
 
     private function mockParametersList(array $products): MockResponse
     {
         return new MockResponse(json_encode([
-            'Status' => 'OK',
-            'Data'   => ['ProductList' => $products],
+            'status' => 'OK',
+            'data'   => ['products' => $products],
         ]));
     }
 
@@ -99,8 +107,8 @@ final class TMEProviderTest extends TestCase
     private function smd0603Products(): MockResponse
     {
         return $this->mockProductList([[
-            'Symbol'                 => 'SMD0603-5K1-1%',
-            'OriginalSymbol'         => '0603SAF5101T5E',
+            'symbol'                 => 'SMD0603-5K1-1%',
+            'manufacturer_symbols'         => '0603SAF5101T5E',
             'Producer'               => 'ROYALOHM',
             'Description'            => 'Resistor: thick film; SMD; 0603; 5.1kΩ; 0.1W; ±1%; 50V; -55÷155°C',
             'Category'               => 'SMD resistors',
@@ -233,7 +241,8 @@ final class TMEProviderTest extends TestCase
     public function testIsActiveWithoutCredentials(): void
     {
         $this->settings->apiToken = null;
-        $provider = new TMEProvider(new TMEClient($this->httpClient, $this->settings), $this->settings);
+        $cache = new \Symfony\Component\Cache\Adapter\ArrayAdapter();
+        $provider = new TMEProvider(new TMEClient($this->httpClient, $this->settings, $cache), $this->settings);
         $this->assertFalse($provider->isActive());
     }
 
@@ -263,31 +272,265 @@ final class TMEProviderTest extends TestCase
 
     public function testSearchByKeyword(): void
     {
-        $this->httpClient->setResponseFactory([$this->smd0603Products()]);
+
+        $this->httpClient->setResponseFactory([function (string $method, string $url, array $options): MockResponse {
+
+            // Check request parameters
+            $exp_url = 'https://api.tme.eu/products/search?country=DE&scope[0]=products&phrase=SMD0603-5K1-1%25&limit=100';
+            $this->assertSame('GET', $method);
+            $this->assertSame($exp_url, $url);
+            $this->assertContains('Authorization: Bearer fake_test_token', $options['headers'] ?? []);
+
+            // Construct response
+            return new MockResponse(json_encode([
+                'status' => 'OK',
+                'data'   => [
+                    'products' => [
+                        'elements' => [
+                            [
+                                'product_status' => [],
+                                'symbol' => 'SMD0603-5K1-1%',
+                                'ean' => '978020137962',
+                                'category' => [
+                                    'name' => 'SMD resistors'
+                                ],
+                                'manufacturer_symbols' => ['0603SAF5101T5E', 'another_symbol'],
+                                'manufacturer' => [
+                                    'name' => 'ROYALOHM'
+                                ],
+                                'description' => 'Resistor: thick film; SMD; 0603; 5.1kΩ; 0.1W; ±1%; 50V; -55÷155°C',
+                                'assets' => [
+                                    'primary_photo' => [
+                                        'prime' => '//images.somecdn.net/somepath/smd0603_primary_prime.jpg'
+
+                                    ]
+                                ]
+                            ],
+                            // Fake product specifically created to test nullable fields
+                            [
+                                'product_status' => ['INVALID'],
+                                'symbol' => 'FAKE_PRODUCT',
+                                'description' => 'High-Quality bleeding edge fake product'
+                            ]
+                        ]
+                    ]
+                ]
+            ]));
+        }]);
 
         $results = $this->provider->searchByKeyword('SMD0603-5K1-1%');
 
         $this->assertIsArray($results);
-        $this->assertCount(1, $results);
+        $this->assertCount(2, $results);
+
         $this->assertInstanceOf(SearchResultDTO::class, $results[0]);
+        $this->assertSame('tme', $results[0]->provider_key);
         $this->assertSame('SMD0603-5K1-1%', $results[0]->provider_id);
         $this->assertSame('0603SAF5101T5E', $results[0]->name);
-        $this->assertSame('ROYALOHM', $results[0]->manufacturer);
+        $this->assertSame('Resistor: thick film; SMD; 0603; 5.1kΩ; 0.1W; ±1%; 50V; -55÷155°C', $results[0]->description);
         $this->assertSame('SMD resistors', $results[0]->category);
+        $this->assertSame('ROYALOHM', $results[0]->manufacturer);
+        $this->assertSame('0603SAF5101T5E', $results[0]->mpn);
+        $this->assertSame('https://images.somecdn.net/somepath/smd0603_primary_prime.jpg', $results[0]->preview_image_url);
         $this->assertSame(ManufacturingStatus::ACTIVE, $results[0]->manufacturing_status);
-        $this->assertSame(
-            'https://www.tme.eu/en/details/smd0603-5k1-1%25/smd-resistors/royalohm/0603saf5101t5e/',
-            $results[0]->provider_url
-        );
+        $this->assertSame('https://www.tme.eu/details/SMD0603-5K1-1%25',$results[0]->provider_url);
+        $this->assertSame('978020137962', $results[0]->gtin);
+
+        $this->assertInstanceOf(SearchResultDTO::class, $results[1]);
+        $this->assertSame('tme', $results[0]->provider_key);
+        $this->assertSame('FAKE_PRODUCT', $results[1]->provider_id);
+        $this->assertSame('FAKE_PRODUCT', $results[1]->name);
+        $this->assertSame('High-Quality bleeding edge fake product', $results[1]->description);
+        $this->assertNull($results[1]->category);
+        $this->assertNull($results[1]->manufacturer);
+        $this->assertNull($results[1]->mpn);
+        $this->assertNull($results[1]->preview_image_url);
+        $this->assertSame(ManufacturingStatus::DISCONTINUED, $results[1]->manufacturing_status);
+        $this->assertSame('https://www.tme.eu/details/FAKE_PRODUCT',$results[1]->provider_url);
+        $this->assertNull($results[1]->gtin);
     }
 
-    public function testGetDetailsWithPercentInPartNumber(): void
+    public function testGetPartDetails(): void
     {
+
         $this->httpClient->setResponseFactory([
-            $this->smd0603Products(),
-            $this->smd0603Files(),
-            $this->smd0603Parameters(),
-            $this->smd0603Prices(),
+            // Request 1: get product info
+            function (string $method, string $url, array $options): MockResponse {
+                // Check request parameters
+                $exp_url = 'https://api.tme.eu/products?country=DE&symbols[0]=SMD0603-5K1-1%25';
+                $this->assertSame('GET', $method);
+                $this->assertSame($exp_url, $url);
+                $this->assertContains('Authorization: Bearer fake_test_token', $options['headers'] ?? []);
+
+                // Construct response
+                return new MockResponse(json_encode([
+                    'status' => 'OK',
+                    'data'   => [
+                        'elements' => [
+                            [
+                                'product_status' => [],
+                                'symbol' => 'SMD0603-5K1-1%',
+                                'ean' => '978020137962',
+                                'category' => [
+                                    'name' => 'SMD resistors'
+                                ],
+                                'manufacturer_symbols' => ['0603SAF5101T5E', 'another_symbol'],
+                                'manufacturer' => [
+                                    'name' => 'ROYALOHM'
+                                ],
+                                'assets' => [
+                                    'primary_photo' => [
+                                        'prime' => '//images.somecdn.net/somepath/smd0603_primary_prime.jpg',
+                                        'high_resolution' => '//images.somecdn.net/somepath/smd0603_primary_high_resolution.jpg'
+                                    ]
+                                ],
+                                'description' => 'Resistor: thick film; SMD; 0603; 5.1kΩ; 0.1W; ±1%; 50V; -55÷155°C',
+                                'weight' => [
+                                    'value' => 10,
+                                    'unit' => 'g',
+                                ]
+                            ]
+                        ]
+                    ]
+                ]));
+            },
+            // Request 2: get files
+            function (string $method, string $url, array $options): MockResponse {
+                // Check request parameters
+                $exp_url = 'https://api.tme.eu/products/files?country=DE&symbols[0]=SMD0603-5K1-1%25';
+                $this->assertSame('GET', $method);
+                $this->assertSame($exp_url, $url);
+                $this->assertContains('Authorization: Bearer fake_test_token', $options['headers'] ?? []);
+
+                // Construct response
+                return new MockResponse(json_encode([
+                    'status' => 'OK',
+                    'data'   => [
+                        'elements' => [
+                            [
+                                'symbol' => 'SMD0603-5K1-1%',
+                                'assets' => [
+                                    'primary_photo' => [
+                                        'prime' => '//images.somecdn.net/somepath/smd0603_primary_prime.jpg',
+                                        'high_resolution' => '//images.somecdn.net/somepath/smd0603_primary_high_resolution.jpg',
+                                    ],
+                                    'additional' => [
+                                        'elements' => [
+                                            [
+                                                'prime' => '//images.somecdn.net/somepath/smd0603_additional1_prime.jpg',
+                                                'high_resolution' => '//images.somecdn.net/somepath/smd0603_additional1_high_resolution.jpg'
+                                            ],
+                                            [
+                                                'prime' => '//images.somecdn.net/somepath/smd0603_additional2_prime.jpg',
+                                            ],
+                                        ]
+                                    ],
+                                ],
+                                'documents' => [
+                                    'elements' => [
+                                        [
+                                            'url' => '//documents.somecdn.net/somepath/smd0603_datasheet.pdf',
+                                            'type' => 'DTE',
+                                            'file_name' => 'smd0603.pdf'
+                                        ],
+                                        // Document of the wrong type, check it doesn't get included
+                                        [
+                                            'url' => '//documents.somecdn.net/somepath/some_firmware.bin',
+                                            'type' => 'SFT',
+                                            'file_name' => 'firmware.pdf'
+                                        ],
+                                        [
+                                            'url' => '//documents.somecdn.net/somepath/smd0603_safety.pdf',
+                                            'type' => 'KCH',
+                                            'file_name' => 'smd0603_safety.pdf'
+                                        ],
+                                    ]
+                                ]
+                            ]
+                        ]
+                    ]
+                ]));
+            },
+            // Request 3: get parameters
+            function (string $method, string $url, array $options): MockResponse {
+                // Check request parameters
+                $exp_url = 'https://api.tme.eu/products/parameters?country=DE&symbols[0]=SMD0603-5K1-1%25';
+                $this->assertSame('GET', $method);
+                $this->assertSame($exp_url, $url);
+                $this->assertContains('Authorization: Bearer fake_test_token', $options['headers'] ?? []);
+
+                // Construct response
+                return new MockResponse(json_encode([
+                    'status' => 'OK',
+                    'data'   => [
+                        'elements' => [
+                            [
+                                'symbol' => 'SMD0603-5K1-1%',
+                                'parameters' => [
+                                    'elements' => [
+                                        [
+                                            'id' => 35,
+                                            'name' => 'Case',
+                                            'values' => [
+                                                [
+                                                    'value' => '0603',
+                                                ]
+                                            ]
+                                        ],
+                                        [
+                                            'id' => 34,
+                                            'name' => 'Resistance',
+                                            'values' => [
+                                                [
+                                                    'value' => '5.1k\u03a9',
+                                                ]
+                                            ]
+                                        ]
+                                    ]
+                                ]
+                            ]
+                        ]
+                    ]
+                ]));
+            },
+            // Request 4: get product pricing information
+            function (string $method, string $url, array $options): MockResponse {
+                // Check request parameters
+                $exp_url = 'https://api.tme.eu/products/data?country=DE&currency=EUR&scope[0]=prices&symbols[0]=SMD0603-5K1-1%25';
+                $this->assertSame('GET', $method);
+                $this->assertSame($exp_url, $url);
+                $this->assertContains('Authorization: Bearer fake_test_token', $options['headers'] ?? []);
+
+                // Construct response
+                return new MockResponse(json_encode([
+                    'status' => 'OK',
+                    'data'   => [
+                        'elements' => [
+                            [
+                                'symbol' => 'SMD0603-5K1-1%',
+                                'prices' => [
+                                    'elements' => [
+                                        [
+                                            'amount' => 1,
+                                            'price' => 0.23
+                                        ],
+                                        [
+                                            'amount' => 50,
+                                            'price' => 0.19
+                                        ],
+                                        [
+                                            'amount' => 100,
+                                            'price' => 0.071
+                                        ],
+                                    ],
+                                    'currency' => 'EUR',
+                                    'type' => 'GROSS'
+                                ]
+                            ]
+                        ]
+                    ]
+                ]));
+            }
         ]);
 
         $result = $this->provider->getDetails('SMD0603-5K1-1%');
@@ -296,79 +539,144 @@ final class TMEProviderTest extends TestCase
         $this->assertSame('SMD0603-5K1-1%', $result->provider_id);
         $this->assertSame('0603SAF5101T5E', $result->name);
         $this->assertSame('Resistor: thick film; SMD; 0603; 5.1kΩ; 0.1W; ±1%; 50V; -55÷155°C', $result->description);
+        $this->assertSame('SMD resistors', $result->category);
         $this->assertSame('ROYALOHM', $result->manufacturer);
         $this->assertSame('0603SAF5101T5E', $result->mpn);
-        $this->assertSame('SMD resistors', $result->category);
+        $this->assertSame('https://images.somecdn.net/somepath/smd0603_primary_high_resolution.jpg', $result->preview_image_url);
         $this->assertSame(ManufacturingStatus::ACTIVE, $result->manufacturing_status);
-        $this->assertSame(0.021, $result->mass);
-        $this->assertSame('1608', $result->footprint);
-        $this->assertSame(
-            'https://www.tme.eu/en/details/smd0603-5k1-1%25/smd-resistors/royalohm/0603saf5101t5e/',
-            $result->provider_url
-        );
+        $this->assertSame('https://www.tme.eu/details/SMD0603-5K1-1%25',$result->provider_url);
+        $this->assertSame('0603', $result->footprint);
+        $this->assertSame('978020137962', $result->gtin);
+        $this->assertSame(10.0, $result->mass);
+
+        $this->assertCount(2, $result->images);
+        $this->assertInstanceOf(FileDTO::class, $result->images[0]);
+        $this->assertSame('https://images.somecdn.net/somepath/smd0603_additional1_high_resolution.jpg', $result->images[0]->url);
+        $this->assertInstanceOf(FileDTO::class, $result->images[1]);
+        $this->assertSame('https://images.somecdn.net/somepath/smd0603_additional2_prime.jpg', $result->images[1]->url);
 
         $this->assertCount(2, $result->datasheets);
-        $this->assertSame('https://www.tme.eu/Document/b315665a56acbc42df513c99b390ad98/ROYALOHM-THICKFILM.pdf', $result->datasheets[0]->url);
-        $this->assertCount(0, $result->images);
+        $this->assertInstanceOf(FileDTO::class, $result->datasheets[0]);
+        $this->assertSame('https://documents.somecdn.net/somepath/smd0603_datasheet.pdf', $result->datasheets[0]->url);
+        $this->assertSame('smd0603.pdf', $result->datasheets[0]->name);
+        $this->assertInstanceOf(FileDTO::class, $result->datasheets[1]);
+        $this->assertSame('https://documents.somecdn.net/somepath/smd0603_safety.pdf', $result->datasheets[1]->url);
+        $this->assertSame('smd0603_safety.pdf', $result->datasheets[1]->name);
+
+        $this->assertCount(2, $result->parameters);
+        $this->assertSame('Case', $result->parameters[0]->name);
+        $this->assertSame('Resistance', $result->parameters[1]->name);
+        // Do not check values, conversion is handled by ParameterDTO
 
         $this->assertCount(1, $result->vendor_infos);
-        $vendorInfo = $result->vendor_infos[0];
-        $this->assertInstanceOf(PurchaseInfoDTO::class, $vendorInfo);
-        $this->assertSame('TME', $vendorInfo->distributor_name);
-        $this->assertSame('SMD0603-5K1-1%', $vendorInfo->order_number);
-        $this->assertSame(
-            'https://www.tme.eu/en/details/smd0603-5k1-1%25/smd-resistors/royalohm/0603saf5101t5e/',
-            $vendorInfo->product_url
-        );
-        $this->assertCount(3, $vendorInfo->prices);
-        $this->assertSame(100.0, $vendorInfo->prices[0]->minimum_discount_amount);
-        $this->assertSame('0.01077', $vendorInfo->prices[0]->price);
-        $this->assertSame('EUR', $vendorInfo->prices[0]->currency_iso_code);
-        $this->assertFalse($vendorInfo->prices[0]->includes_tax);
+        $this->assertInstanceOf(PurchaseInfoDTO::class, $result->vendor_infos[0]);
+        $this->assertSame('TME', $result->vendor_infos[0]->distributor_name);
+        $this->assertSame('SMD0603-5K1-1%', $result->vendor_infos[0]->order_number);
+        $this->assertSame('https://www.tme.eu/details/SMD0603-5K1-1%25',$result->vendor_infos[0]->product_url);
+        $this->assertCount(3, $result->vendor_infos[0]->prices);
+        $this->assertSame(1.0, $result->vendor_infos[0]->prices[0]->minimum_discount_amount);
+        $this->assertSame('0.23', $result->vendor_infos[0]->prices[0]->price);
+        $this->assertSame('EUR', $result->vendor_infos[0]->prices[0]->currency_iso_code);
+        $this->assertTrue($result->vendor_infos[0]->prices[0]->includes_tax);
+        $this->assertSame(50.0, $result->vendor_infos[0]->prices[1]->minimum_discount_amount);
+        $this->assertSame('0.19', $result->vendor_infos[0]->prices[1]->price);
+        $this->assertSame('EUR', $result->vendor_infos[0]->prices[1]->currency_iso_code);
+        $this->assertTrue($result->vendor_infos[0]->prices[1]->includes_tax);
+        $this->assertSame(100.0, $result->vendor_infos[0]->prices[2]->minimum_discount_amount);
+        $this->assertSame('0.071', $result->vendor_infos[0]->prices[2]->price);
+        $this->assertSame('EUR', $result->vendor_infos[0]->prices[2]->currency_iso_code);
+        $this->assertTrue($result->vendor_infos[0]->prices[2]->includes_tax);
 
-        $this->assertCount(5, $result->parameters);
     }
 
-    public function testGetDetailsForEtqp3m6r8kvp(): void
-    {
-        $this->httpClient->setResponseFactory([
-            $this->etqp3mProducts(),
-            $this->etqp3mFiles(),
-            $this->etqp3mParameters(),
-            $this->etqp3mPrices(),
-        ]);
+    //public function testGetDetailsWithPercentInPartNumber(): void
+    //{
+    //    $this->httpClient->setResponseFactory([
+    //        $this->smd0603Products(),
+    //        $this->smd0603Files(),
+    //        $this->smd0603Parameters(),
+    //        $this->smd0603Prices(),
+    //    ]);
 
-        $result = $this->provider->getDetails('ETQP3M6R8KVP');
+    //    $result = $this->provider->getDetails('SMD0603-5K1-1%');
 
-        $this->assertInstanceOf(PartDetailDTO::class, $result);
-        $this->assertSame('ETQP3M6R8KVP', $result->provider_id);
-        $this->assertSame('ETQP3M6R8KVP', $result->name);
-        $this->assertSame('Inductor: wire; SMD; 6.8uH; 2.9A; R: 65.7mΩ; ±20%; ETQP3M; 5.5x5x3mm', $result->description);
-        $this->assertSame('PANASONIC', $result->manufacturer);
-        $this->assertSame('ETQP3M6R8KVP', $result->mpn);
-        $this->assertSame('Inductors', $result->category);
-        $this->assertSame(ManufacturingStatus::ACTIVE, $result->manufacturing_status);
-        $this->assertSame(0.44, $result->mass);
-        $this->assertNull($result->footprint);
-        $this->assertSame('https://www.tme.eu/en/details/etqp3m6r8kvp/inductors/panasonic/', $result->provider_url);
+    //    $this->assertInstanceOf(PartDetailDTO::class, $result);
+    //    $this->assertSame('SMD0603-5K1-1%', $result->provider_id);
+    //    $this->assertSame('0603SAF5101T5E', $result->name);
+    //    $this->assertSame('Resistor: thick film; SMD; 0603; 5.1kΩ; 0.1W; ±1%; 50V; -55÷155°C', $result->description);
+    //    $this->assertSame('ROYALOHM', $result->manufacturer);
+    //    $this->assertSame('0603SAF5101T5E', $result->mpn);
+    //    $this->assertSame('SMD resistors', $result->category);
+    //    $this->assertSame(ManufacturingStatus::ACTIVE, $result->manufacturing_status);
+    //    $this->assertSame(0.021, $result->mass);
+    //    $this->assertSame('1608', $result->footprint);
+    //    $this->assertSame(
+    //        'https://www.tme.eu/en/details/smd0603-5k1-1%25/smd-resistors/royalohm/0603saf5101t5e/',
+    //        $result->provider_url
+    //    );
 
-        $this->assertCount(2, $result->datasheets);
-        $this->assertSame('https://www.tme.eu/Document/50a845881f09d8a2248350946e11df38/AGL0000C63.pdf', $result->datasheets[0]->url);
-        $this->assertCount(0, $result->images);
+    //    $this->assertCount(2, $result->datasheets);
+    //    $this->assertSame('https://www.tme.eu/Document/b315665a56acbc42df513c99b390ad98/ROYALOHM-THICKFILM.pdf', $result->datasheets[0]->url);
+    //    $this->assertCount(0, $result->images);
 
-        $this->assertCount(1, $result->vendor_infos);
-        $vendorInfo = $result->vendor_infos[0];
-        $this->assertSame('TME', $vendorInfo->distributor_name);
-        $this->assertSame('ETQP3M6R8KVP', $vendorInfo->order_number);
-        $this->assertSame('https://www.tme.eu/en/details/etqp3m6r8kvp/inductors/panasonic/', $vendorInfo->product_url);
-        $this->assertCount(3, $vendorInfo->prices);
-        $this->assertSame(1.0, $vendorInfo->prices[0]->minimum_discount_amount);
-        $this->assertSame('0.589', $vendorInfo->prices[0]->price);
-        $this->assertSame('EUR', $vendorInfo->prices[0]->currency_iso_code);
-        $this->assertFalse($vendorInfo->prices[0]->includes_tax);
+    //    $this->assertCount(1, $result->vendor_infos);
+    //    $vendorInfo = $result->vendor_infos[0];
+    //    $this->assertInstanceOf(PurchaseInfoDTO::class, $vendorInfo);
+    //    $this->assertSame('TME', $vendorInfo->distributor_name);
+    //    $this->assertSame('SMD0603-5K1-1%', $vendorInfo->order_number);
+    //    $this->assertSame(
+    //        'https://www.tme.eu/en/details/smd0603-5k1-1%25/smd-resistors/royalohm/0603saf5101t5e/',
+    //        $vendorInfo->product_url
+    //    );
+    //    $this->assertCount(3, $vendorInfo->prices);
+    //    $this->assertSame(100.0, $vendorInfo->prices[0]->minimum_discount_amount);
+    //    $this->assertSame('0.01077', $vendorInfo->prices[0]->price);
+    //    $this->assertSame('EUR', $vendorInfo->prices[0]->currency_iso_code);
+    //    $this->assertFalse($vendorInfo->prices[0]->includes_tax);
 
-        $this->assertCount(3, $result->parameters);
-    }
+    //    $this->assertCount(5, $result->parameters);
+    //}
+
+    //public function testGetDetailsForEtqp3m6r8kvp(): void
+    //{
+    //    $this->httpClient->setResponseFactory([
+    //        $this->etqp3mProducts(),
+    //        $this->etqp3mFiles(),
+    //        $this->etqp3mParameters(),
+    //        $this->etqp3mPrices(),
+    //    ]);
+
+    //    $result = $this->provider->getDetails('ETQP3M6R8KVP');
+
+    //    $this->assertInstanceOf(PartDetailDTO::class, $result);
+    //    $this->assertSame('ETQP3M6R8KVP', $result->provider_id);
+    //    $this->assertSame('ETQP3M6R8KVP', $result->name);
+    //    $this->assertSame('Inductor: wire; SMD; 6.8uH; 2.9A; R: 65.7mΩ; ±20%; ETQP3M; 5.5x5x3mm', $result->description);
+    //    $this->assertSame('PANASONIC', $result->manufacturer);
+    //    $this->assertSame('ETQP3M6R8KVP', $result->mpn);
+    //    $this->assertSame('Inductors', $result->category);
+    //    $this->assertSame(ManufacturingStatus::ACTIVE, $result->manufacturing_status);
+    //    $this->assertSame(0.44, $result->mass);
+    //    $this->assertNull($result->footprint);
+    //    $this->assertSame('https://www.tme.eu/en/details/etqp3m6r8kvp/inductors/panasonic/', $result->provider_url);
+
+    //    $this->assertCount(2, $result->datasheets);
+    //    $this->assertSame('https://www.tme.eu/Document/50a845881f09d8a2248350946e11df38/AGL0000C63.pdf', $result->datasheets[0]->url);
+    //    $this->assertCount(0, $result->images);
+
+    //    $this->assertCount(1, $result->vendor_infos);
+    //    $vendorInfo = $result->vendor_infos[0];
+    //    $this->assertSame('TME', $vendorInfo->distributor_name);
+    //    $this->assertSame('ETQP3M6R8KVP', $vendorInfo->order_number);
+    //    $this->assertSame('https://www.tme.eu/en/details/etqp3m6r8kvp/inductors/panasonic/', $vendorInfo->product_url);
+    //    $this->assertCount(3, $vendorInfo->prices);
+    //    $this->assertSame(1.0, $vendorInfo->prices[0]->minimum_discount_amount);
+    //    $this->assertSame('0.589', $vendorInfo->prices[0]->price);
+    //    $this->assertSame('EUR', $vendorInfo->prices[0]->currency_iso_code);
+    //    $this->assertFalse($vendorInfo->prices[0]->includes_tax);
+
+    //    $this->assertCount(3, $result->parameters);
+    //}
 
     public function testNormalizeURLEncodesBarePctSign(): void
     {
