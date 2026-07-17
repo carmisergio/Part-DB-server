@@ -132,7 +132,7 @@ class TMEProvider implements InfoProviderInterface, URLHandlerInfoProviderInterf
             images: $files['images'],
             parameters: $parameters['parameters'],
             vendor_infos: [$vendor_info],
-            mass: $product['weight']['unit'] ?? null === 'g' ? $product['weight']['value'] : null,
+            mass: ($product['weight']['unit'] ?? null) === 'g' ? $product['weight']['value'] : null,
         );
     }
 
