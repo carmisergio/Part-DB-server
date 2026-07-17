@@ -86,7 +86,7 @@ class TMEClient
 
             // Request new session from the API
             $response = $this->tmeClient->request('POST', $this->getUrlForEndpoint('/auth/token'), [
-                'auth_basic' => [$this->settings->apiSecret, $this->settings->apiToken],
+                'auth_basic' => [$this->settings->apiToken, $this->settings->apiSecret],
                 'body' => ['grant_type' => 'client_credentials'],
             ]);
 
