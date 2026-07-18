@@ -59,11 +59,6 @@ class TMESettings
     #[Assert\Choice(choices: self::SUPPORTED_CURRENCIES)]
     public string $currency = "EUR";
 
-    #[SettingsParameter(label: new TM("settings.ips.tme.language"), formType: LanguageType::class, formOptions: ["preferred_choices" => ["en", "de", "fr", "pl"]],
-        envVar: "PROVIDER_TME_LANGUAGE", envVarMode: EnvVarMode::OVERWRITE)]
-    #[Assert\Language]
-    public string $language = "en";
-
     #[SettingsParameter(label: new TM("settings.ips.tme.country"), formType: CountryType::class, formOptions: ["preferred_choices" => ["DE", "PL", "GB", "FR"]],
         envVar: "PROVIDER_TME_COUNTRY", envVarMode: EnvVarMode::OVERWRITE)]
     #[Assert\Country]
